@@ -1,0 +1,45 @@
+# Node / TypeScript
+node_modules/
+dist/
+build/
+*.js.map
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Go
+*.exe
+*.test
+vendor/
+
+# WhatsApp auth / session files — NEVER commit these
+whatsapp-bridge/store/
+*.db
+*.sqlite
+*.sqlite3
+creds.json
+session.json
+auth_info_baileys/
+baileys_auth_info/
+*.session
+whatsapp_session/
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
