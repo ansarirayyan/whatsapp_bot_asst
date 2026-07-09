@@ -17,7 +17,14 @@ venv/
 # Go
 *.exe
 *.test
+*.bin
 vendor/
+
+# Vendored upstream + build artifacts (never commit to public repo)
+whatsapp-bridge/whatsapp-bridge
+**/store/
+**/messages.db
+**/whatsapp.db
 
 # WhatsApp auth / session files — NEVER commit these
 whatsapp-bridge/store/
