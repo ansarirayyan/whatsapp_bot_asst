@@ -1,0 +1,286 @@
+# Patch: vendor/whatsapp-mcp/whatsapp-bridge/main.go
+# Generated: 2026-07-09
+# Base: upstream lharries/whatsapp-mcp HEAD (7d6a06d)
+# Applied: local whatsapp-bridge/main.go
+#
+# This file preserves all local modifications to the vendored bridge binary so
+# they survive a fresh re-clone of the upstream repo.  To reapply after a fresh
+# clone, run from the repo root:
+#
+#   cd vendor/whatsapp-mcp
+#   patch -p1 < ../../patches/whatsapp-bridge-main.patch
+#
+# --------------------------------------------------------------------------
+# SECTION A — Previously applied patches (in-place when this patch was generated)
+# --------------------------------------------------------------------------
+#   A1. DeviceProps set to Chrome before NewClient  (ban-avoidance cosmetic)
+#   A2. /tmp/wa_paircode.txt dump on QR code events (tooling convenience)
+#   A3. whatsmeow API compat fixes: context.Background() added to
+#       sqlstore.New, container.GetFirstDevice, client.Download,
+#       client.GetGroupInfo, client.Store.Contacts.GetContact
+#
+# --------------------------------------------------------------------------
+# SECTION B — New patches added 2026-07-09 (ban-avoidance behavioural reducers)
+# --------------------------------------------------------------------------
+#   B1. Outbound throttle (applyOutboundThrottle)
+#       - Package-level sync.Mutex + lastSendTime to serialise sends
+#       - WA_SEND_MIN_MS (default 1500): lower bound of per-send random delay (ms)
+#       - WA_SEND_MAX_MS (default 5000): upper bound of per-send random delay (ms)
+#       - WA_SEND_GAP_MS (default 1200): minimum gap between consecutive sends (ms)
+#       - All three set to 0 → throttling disabled
+#       - Called inside sendWhatsAppMessage, before client.SendMessage
+#
+#   B2. Reactive-only mode (WA_REACTIVE_ONLY)
+#       - Env var WA_REACTIVE_ONLY=true|1 (default: off)
+#       - Gate in /api/send handler: checks messages SQLite DB for any row
+#         WHERE chat_jid = <recipient> AND is_from_me = 0
+#       - If no inbound message exists from that JID → HTTP 403 + JSON error
+#       - Store-backed (not in-memory): survives restarts
+#       - Fails open on DB error (logs warning, allows send)
+#
+#   B3. Reconnect: confirmed safe — no changes needed
+#       - whatsmeow EnableAutoReconnect=true by default (client.go line 284)
+#       - Backoff: N*2s linear (AutoReconnectErrors * 2 * time.Second)
+#       - No manual reconnect loop in our code; no storm risk
+#
+# --------------------------------------------------------------------------
+
+diff --git a/whatsapp-bridge/main.go b/whatsapp-bridge/main.go
+index d1e0270..af8b4af 100644
+--- a/whatsapp-bridge/main.go
++++ b/whatsapp-bridge/main.go
+@@ -13,7 +13,9 @@ import (
+ 	"os/signal"
+ 	"path/filepath"
+ 	"reflect"
++	"strconv"
+ 	"strings"
++	"sync"
+ 	"syscall"
+ 	"time"
+
+@@ -24,6 +26,8 @@ import (
+
+ 	"go.mau.fi/whatsmeow"
+ 	waProto "go.mau.fi/whatsmeow/binary/proto"
++	waCompanionReg "go.mau.fi/whatsmeow/proto/waCompanionReg"
++	wastore "go.mau.fi/whatsmeow/store"
+ 	"go.mau.fi/whatsmeow/store/sqlstore"
+ 	"go.mau.fi/whatsmeow/types"
+ 	"go.mau.fi/whatsmeow/types/events"
+@@ -31,6 +35,110 @@ import (
+ 	"google.golang.org/protobuf/proto"
+ )
+
++// ---------------------------------------------------------------------------
++// Ban-avoidance: outbound throttle state
++// ---------------------------------------------------------------------------
++
++// sendMu serialises outbound sends so that gap + jitter are applied correctly
++// even if multiple goroutines hit /api/send concurrently.
++var (
++	sendMu       sync.Mutex
++	lastSendTime time.Time
++)
++
++// getEnvIntDefault reads an integer env var, returning def when the variable is
++// absent or not parseable.
++func getEnvIntDefault(key string, def int) int {
++	v := os.Getenv(key)
++	if v == "" {
++		return def
++	}
++	n, err := strconv.Atoi(v)
++	if err != nil {
++		return def
++	}
++	return n
++}
++
++// applyOutboundThrottle sleeps before every outbound send to produce
++// human-paced message timing.
++//
++// Env vars (all in milliseconds):
++//
++//	WA_SEND_MIN_MS  — lower bound of the random per-send delay  (default 1500)
++//	WA_SEND_MAX_MS  — upper bound of the random per-send delay  (default 5000)
++//	WA_SEND_GAP_MS  — minimum wall-clock gap between any two sends (default 1200)
++//
++// Set all three to 0 to disable throttling entirely.
++func applyOutboundThrottle() {
++	minMs := getEnvIntDefault("WA_SEND_MIN_MS", 1500)
++	maxMs := getEnvIntDefault("WA_SEND_MAX_MS", 5000)
++	gapMs := getEnvIntDefault("WA_SEND_GAP_MS", 1200)
++
++	// Bypass when all three are explicitly zeroed.
++	if minMs == 0 && maxMs == 0 && gapMs == 0 {
++		return
++	}
++
++	// Hold the mutex for the entire sleep so that concurrent senders queue
++	// and each one waits the full gap from the previous send.
++	sendMu.Lock()
++	defer sendMu.Unlock()
++
++	// 1. Enforce minimum gap since the last send.
++	if gapMs > 0 && !lastSendTime.IsZero() {
++		elapsed := time.Since(lastSendTime)
++		gap := time.Duration(gapMs) * time.Millisecond
++		if elapsed < gap {
++			time.Sleep(gap - elapsed)
++		}
++	}
++
++	// 2. Add a randomised human-paced delay on top of the gap.
++	if minMs > 0 || maxMs > 0 {
++		hi := maxMs
++		if hi < minMs {
++			hi = minMs
++		}
++		spread := hi - minMs
++		var delay time.Duration
++		if spread > 0 {
++			delay = time.Duration(minMs+rand.Intn(spread+1)) * time.Millisecond
++		} else {
++			delay = time.Duration(minMs) * time.Millisecond
++		}
++		if delay > 0 {
++			time.Sleep(delay)
++		}
++	}
++
++	// 3. Record the send time while still holding the mutex so the next
++	//    caller's gap calculation is accurate.
++	lastSendTime = time.Now()
++}
++
++// hasReceivedMessageFromJID returns true when the local message store contains
++// at least one inbound message (is_from_me = false) from the given JID.
++// Used to enforce WA_REACTIVE_ONLY mode.
++func hasReceivedMessageFromJID(messageStore *MessageStore, recipient string) (bool, error) {
++	// Normalise to a full JID string (e.g. "491701234567@s.whatsapp.net").
++	jid := recipient
++	if !strings.Contains(jid, "@") {
++		jid = jid + "@s.whatsapp.net"
++	}
++	var count int
++	err := messageStore.db.QueryRow(
++		"SELECT COUNT(*) FROM messages WHERE chat_jid = ? AND is_from_me = 0",
++		jid,
++	).Scan(&count)
++	if err != nil {
++		return false, err
++	}
++	return count > 0, nil
++}
++
++// ---------------------------------------------------------------------------
++
+ // Message represents a chat message for our client
+ type Message struct {
+ 	Time      time.Time
+@@ -361,6 +469,10 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
+ 		msg.Conversation = proto.String(message)
+ 	}
+
++	// Apply human-paced throttle before sending (gap enforcement + random delay).
++	// Controlled by WA_SEND_MIN_MS / WA_SEND_MAX_MS / WA_SEND_GAP_MS.
++	applyOutboundThrottle()
++
+ 	// Send message
+ 	_, err = client.SendMessage(context.Background(), recipientJID, msg)
+
+@@ -641,7 +753,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
+ 	}
+
+ 	// Download the media using whatsmeow client
+-	mediaData, err := client.Download(downloader)
++	mediaData, err := client.Download(context.Background(), downloader)
+ 	if err != nil {
+ 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
+ 	}
+@@ -705,6 +817,25 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port
+
+ 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
+
++		// WA_REACTIVE_ONLY gate: when enabled, block sends to any JID that has
++		// not sent us an inbound message first (store-backed check).
++		reactiveOnly := os.Getenv("WA_REACTIVE_ONLY") == "true" || os.Getenv("WA_REACTIVE_ONLY") == "1"
++		if reactiveOnly {
++			allowed, checkErr := hasReceivedMessageFromJID(messageStore, req.Recipient)
++			if checkErr != nil {
++				// Log but don't hard-block on a DB error — fail open with a warning.
++				fmt.Printf("WA_REACTIVE_ONLY: DB check failed for %s: %v (failing open)\n", req.Recipient, checkErr)
++			} else if !allowed {
++				w.Header().Set("Content-Type", "application/json")
++				w.WriteHeader(http.StatusForbidden)
++				json.NewEncoder(w).Encode(SendMessageResponse{
++					Success: false,
++					Message: fmt.Sprintf("WA_REACTIVE_ONLY is enabled: %s has not messaged us first — cold sends are blocked", req.Recipient),
++				})
++				return
++			}
++		}
++
+ 		// Send the message
+ 		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+ 		fmt.Println("Message sent", success, message)
+@@ -800,14 +931,14 @@ func main() {
+ 		return
+ 	}
+
+-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
++	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+ 	if err != nil {
+ 		logger.Errorf("Failed to connect to database: %v", err)
+ 		return
+ 	}
+
+ 	// Get device store - This contains session information
+-	deviceStore, err := container.GetFirstDevice()
++	deviceStore, err := container.GetFirstDevice(context.Background())
+ 	if err != nil {
+ 		if err == sql.ErrNoRows {
+ 			// No device exists, create one
+@@ -819,6 +950,11 @@ func main() {
+ 		}
+ 	}
+
++	// Present as a normal Chrome desktop client instead of whatsmeow's default
++	// (which announces Os="whatsmeow", PlatformType=UNKNOWN → shows as "Other device").
++	wastore.DeviceProps.Os = proto.String("Chrome")
++	wastore.DeviceProps.PlatformType = waCompanionReg.DeviceProps_CHROME.Enum()
++
+ 	// Create client instance
+ 	client := whatsmeow.NewClient(deviceStore, logger)
+ 	if client == nil {
+@@ -871,6 +1007,11 @@ func main() {
+ 			if evt.Event == "code" {
+ 				fmt.Println("\nScan this QR code with your WhatsApp app:")
+ 				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
++				// Write raw pairing code to file so external tools can render a real PNG QR.
++				// This file holds only the LATEST rotating code; it is in /tmp (outside the repo).
++				if err := os.WriteFile("/tmp/wa_paircode.txt", []byte(evt.Code), 0600); err != nil {
++					fmt.Printf("Warning: could not write /tmp/wa_paircode.txt: %v\n", err)
++				}
+ 			} else if evt.Event == "success" {
+ 				connected <- true
+ 				break
+@@ -973,7 +1114,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
+
+ 		// If we didn't get a name, try group info
+ 		if name == "" {
+-			groupInfo, err := client.GetGroupInfo(jid)
++			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
+ 			if err == nil && groupInfo.Name != "" {
+ 				name = groupInfo.Name
+ 			} else {
+@@ -988,7 +1129,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
+ 		logger.Infof("Getting name for contact: %s", chatJID)
+
+ 		// Just use contact info (full name)
+-		contact, err := client.Store.Contacts.GetContact(jid)
++		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
+ 		if err == nil && contact.FullName != "" {
+ 			name = contact.FullName
+ 		} else if sender != "" {

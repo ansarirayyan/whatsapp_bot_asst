@@ -137,6 +137,72 @@ Or add the following JSON block to your project `.mcp.json`:
 
 ---
 
+## Ban-avoidance environment variables
+
+These env vars control the ban-avoidance behavioural reducers baked into our
+local `main.go` patch (see `patches/whatsapp-bridge-main.patch`).
+
+### Outbound send throttle
+
+All values are in **milliseconds**. The defaults are active when the variables
+are absent; set all three to `0` to bypass throttling entirely.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `WA_SEND_MIN_MS` | `1500` | Lower bound of the per-send random delay |
+| `WA_SEND_MAX_MS` | `5000` | Upper bound of the per-send random delay |
+| `WA_SEND_GAP_MS` | `1200` | Minimum wall-clock gap between any two consecutive sends |
+
+Before every outbound `client.SendMessage` call the bridge:
+1. Waits until at least `WA_SEND_GAP_MS` ms have elapsed since the last send.
+2. Sleeps an additional random duration uniformly drawn from
+   `[WA_SEND_MIN_MS, WA_SEND_MAX_MS]`.
+
+A global mutex serialises all senders so concurrent callers queue rather than
+race.
+
+### Reactive-only mode
+
+| Variable | Default | Values |
+|---|---|---|
+| `WA_REACTIVE_ONLY` | _(unset = off)_ | `true` or `1` to enable |
+
+When enabled, the `/api/send` handler queries the local `messages.db` SQLite
+store for any inbound message (`is_from_me = 0`) from the target JID **before**
+sending. If no inbound message exists (i.e. the contact has never messaged us),
+the send is refused with HTTP 403 and a JSON error body:
+
+```json
+{"success":false,"message":"WA_REACTIVE_ONLY is enabled: <jid> has not messaged us first — cold sends are blocked"}
+```
+
+This is **store-backed** — it survives bridge restarts. On a DB error the gate
+fails open (logs a warning, allows the send) rather than silently dropping
+messages.
+
+Default is **off** so existing integrations are unaffected.
+
+### Example launch with all flags set
+
+```bash
+export WA_SEND_MIN_MS=2000
+export WA_SEND_MAX_MS=6000
+export WA_SEND_GAP_MS=1500
+export WA_REACTIVE_ONLY=true
+
+cd /home/rayyan/whatsapp_bot_asst/vendor/whatsapp-mcp/whatsapp-bridge
+./whatsapp-bridge
+```
+
+### Reconnect behaviour (no env var needed)
+
+whatsmeow's built-in auto-reconnect is on by default (`EnableAutoReconnect=true`).
+On disconnection it backs off `N × 2 s` (linear, starts at 2 s) before each
+retry — no storm risk. Our code calls `client.Connect()` exactly once; there is
+no manual reconnect loop.
+
+---
+
 ## Security reminders
 
 - `vendor/` is gitignored — the upstream code and all build artifacts **never land in the public repo**.
