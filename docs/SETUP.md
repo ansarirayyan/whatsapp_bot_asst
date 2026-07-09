@@ -182,6 +182,30 @@ messages.
 
 Default is **off** so existing integrations are unaffected.
 
+### Typing indicator (composing presence)
+
+WhatsApp's own abuse whitepaper (pp. 7–8) explicitly names absence of the
+typing indicator as an anti-automation ban signal: *"If an account continually
+sends messages without triggering the typing indicator, it can be a signal of
+abuse, and we will ban the account."*
+
+Before every `client.SendMessage` call the bridge sends a `composing` chat
+presence to the recipient JID using whatsmeow's
+`client.SendChatPresence(ctx, jid, types.ChatPresenceComposing, types.ChatPresenceMediaText)`,
+then pauses for `WA_TYPING_PAUSE_MS` to simulate a human typing.
+
+| Variable | Default | Values |
+|---|---|---|
+| `WA_TYPING_INDICATOR` | _(unset = **on**)_ | `false` or `0` to disable |
+| `WA_TYPING_PAUSE_MS` | `1500` | Milliseconds to hold the composing presence before sending |
+
+**Default is ON** — the indicator is sent unless you explicitly opt out.
+A presence error is non-fatal: it is logged as a warning and the actual message
+send proceeds regardless.
+
+The `recipientJID` used is the already-parsed message target (the same JID
+passed to `client.SendMessage`) — never the client's own JID.
+
 ### Example launch with all flags set
 
 ```bash
@@ -189,6 +213,9 @@ export WA_SEND_MIN_MS=2000
 export WA_SEND_MAX_MS=6000
 export WA_SEND_GAP_MS=1500
 export WA_REACTIVE_ONLY=true
+# Typing indicator is ON by default; no need to set WA_TYPING_INDICATOR
+# Optionally override the typing pause:
+export WA_TYPING_PAUSE_MS=2000
 
 cd /home/rayyan/whatsapp_bot_asst/vendor/whatsapp-mcp/whatsapp-bridge
 ./whatsapp-bridge

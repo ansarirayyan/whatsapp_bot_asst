@@ -20,7 +20,7 @@
 #       client.GetGroupInfo, client.Store.Contacts.GetContact
 #
 # --------------------------------------------------------------------------
-# SECTION B — New patches added 2026-07-09 (ban-avoidance behavioural reducers)
+# SECTION B — Patches added 2026-07-09 (ban-avoidance behavioural reducers)
 # --------------------------------------------------------------------------
 #   B1. Outbound throttle (applyOutboundThrottle)
 #       - Package-level sync.Mutex + lastSendTime to serialise sends
@@ -44,9 +44,28 @@
 #       - No manual reconnect loop in our code; no storm risk
 #
 # --------------------------------------------------------------------------
+# SECTION C — Patches added 2026-07-09 (typing indicator — explicit whitepaper signal)
+# --------------------------------------------------------------------------
+#   C1. Composing presence (typing indicator) before every outbound send
+#       WhatsApp's own abuse whitepaper (pp. 7–8) names the ABSENCE of the
+#       typing indicator as a documented anti-automation ban trigger:
+#         "If an account continually sends messages without triggering the
+#          typing indicator, it can be a signal of abuse, and we will ban
+#          the account."
+#       Implementation:
+#         - client.SendChatPresence(ctx, recipientJID,
+#             types.ChatPresenceComposing, types.ChatPresenceMediaText)
+#           is called AFTER applyOutboundThrottle(), BEFORE client.SendMessage()
+#         - On presence error: logged as Warning, send proceeds (non-fatal guard)
+#         - Pause after composing: WA_TYPING_PAUSE_MS (default 1500 ms)
+#         - Toggle: WA_TYPING_INDICATOR (default: ON; set "false"/"0" to disable)
+#       The recipientJID used is the already-parsed message target — not the
+#       client's own JID.
+#
+# --------------------------------------------------------------------------
 
 diff --git a/whatsapp-bridge/main.go b/whatsapp-bridge/main.go
-index d1e0270..af8b4af 100644
+index d1e0270..2ed1392 100644
 --- a/whatsapp-bridge/main.go
 +++ b/whatsapp-bridge/main.go
 @@ -13,7 +13,9 @@ import (
@@ -179,7 +198,7 @@ index d1e0270..af8b4af 100644
  // Message represents a chat message for our client
  type Message struct {
  	Time      time.Time
-@@ -361,6 +469,10 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
+@@ -361,6 +469,37 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
  		msg.Conversation = proto.String(message)
  	}
 
@@ -187,10 +206,37 @@ index d1e0270..af8b4af 100644
 +	// Controlled by WA_SEND_MIN_MS / WA_SEND_MAX_MS / WA_SEND_GAP_MS.
 +	applyOutboundThrottle()
 +
++	// Ban-avoidance: send a "composing" (typing) presence before the message.
++	// WhatsApp's own abuse whitepaper (pp. 7–8) explicitly names absence of the
++	// typing indicator as a documented anti-automation signal: "If an account
++	// continually sends messages without triggering the typing indicator, it can
++	// be a signal of abuse, and we will ban the account."
++	//
++	// Controlled by WA_TYPING_INDICATOR (default: on).
++	//   Set to "false" or "0" to disable entirely.
++	// Typing pause duration: WA_TYPING_PAUSE_MS (default: 1500 ms).
++	//   This is the time we hold the composing presence before sending, simulating
++	//   a human actually typing the message.
++	{
++		waTypingIndicator := os.Getenv("WA_TYPING_INDICATOR")
++		typingEnabled := waTypingIndicator != "false" && waTypingIndicator != "0"
++		if typingEnabled {
++			if presErr := client.SendChatPresence(context.Background(), recipientJID, types.ChatPresenceComposing, types.ChatPresenceMediaText); presErr != nil {
++				// Log but never block the actual send — a presence error is non-fatal.
++				fmt.Printf("Warning: failed to send composing presence to %s: %v (send will proceed)\n", recipient, presErr)
++			} else {
++				pauseMs := getEnvIntDefault("WA_TYPING_PAUSE_MS", 1500)
++				if pauseMs > 0 {
++					time.Sleep(time.Duration(pauseMs) * time.Millisecond)
++				}
++			}
++		}
++	}
++
  	// Send message
  	_, err = client.SendMessage(context.Background(), recipientJID, msg)
 
-@@ -641,7 +753,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
+@@ -641,7 +780,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
  	}
 
  	// Download the media using whatsmeow client
@@ -199,7 +245,7 @@ index d1e0270..af8b4af 100644
  	if err != nil {
  		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
  	}
-@@ -705,6 +817,25 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port
+@@ -705,6 +844,25 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port
 
  		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
@@ -225,7 +271,7 @@ index d1e0270..af8b4af 100644
  		// Send the message
  		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
  		fmt.Println("Message sent", success, message)
-@@ -800,14 +931,14 @@ func main() {
+@@ -800,14 +958,14 @@ func main() {
  		return
  	}
 
@@ -242,7 +288,7 @@ index d1e0270..af8b4af 100644
  	if err != nil {
  		if err == sql.ErrNoRows {
  			// No device exists, create one
-@@ -819,6 +950,11 @@ func main() {
+@@ -819,6 +977,11 @@ func main() {
  		}
  	}
 
@@ -254,7 +300,7 @@ index d1e0270..af8b4af 100644
  	// Create client instance
  	client := whatsmeow.NewClient(deviceStore, logger)
  	if client == nil {
-@@ -871,6 +1007,11 @@ func main() {
+@@ -871,6 +1034,11 @@ func main() {
  			if evt.Event == "code" {
  				fmt.Println("\nScan this QR code with your WhatsApp app:")
  				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
@@ -266,7 +312,7 @@ index d1e0270..af8b4af 100644
  			} else if evt.Event == "success" {
  				connected <- true
  				break
-@@ -973,7 +1114,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
+@@ -973,7 +1141,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
  		// If we didn't get a name, try group info
  		if name == "" {
@@ -275,7 +321,7 @@ index d1e0270..af8b4af 100644
  			if err == nil && groupInfo.Name != "" {
  				name = groupInfo.Name
  			} else {
-@@ -988,7 +1129,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
+@@ -988,7 +1156,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
  		logger.Infof("Getting name for contact: %s", chatJID)
 
  		// Just use contact info (full name)
